@@ -36,6 +36,84 @@ class CaptureRecord:
     key_shape: tuple[int, ...]
     value_shape: tuple[int, ...]
     decode_step: int
+    # Computed attention weights softmax(Q @ K^T / sqrt(d_h)) when the caller
+    # supplied a K_full reconstruction. None if only shape was recorded.
+    weights: torch.Tensor | None = None
+
+
+def compute_attention_weights(
+    query: torch.Tensor,
+    key_full: torch.Tensor,
+    causal: bool = True,
+) -> torch.Tensor:
+    """Compute softmax(Q @ K_full^T / sqrt(d_h)) for the capture layer.
+
+    Mirrors what FlashAttention's fused kernel computes internally, run as a
+    side-compute on the same Q and K tensors. The numeric result is suitable
+    for the EVOKE multi-signal scorer; it is not used to feed the model.
+
+    Args:
+        query: shape [num_q, num_heads, head_size].
+        key_full: shape [num_kv, num_kv_heads, head_size]. Caller must
+            reconstruct this from the paged KV cache for the relevant
+            sequence; passing only the per-step `key` from the layer's
+            forward gives current-step-only attention, not the historical
+            distribution.
+        causal: when True, mask out positions i,j where j > num_kv -
+            num_q + i so the query can only attend to past keys. Set False
+            for bidirectional attention.
+
+    Returns:
+        shape [num_q, num_heads, num_kv] in float32, summing to 1.0 along
+        the last axis at every (q, head) position.
+    """
+    num_q, num_heads, head_size = query.shape
+    num_kv, num_kv_heads, _ = key_full.shape
+    if num_heads != num_kv_heads:
+        # GQA: replicate each KV head to span the heads that share it.
+        repeats = num_heads // num_kv_heads
+        key_full = key_full.repeat_interleave(repeats, dim=1)
+    # einsum: [num_q, num_heads, head_size] @ [num_kv, num_heads, head_size]
+    # -> [num_q, num_heads, num_kv]
+    scores = torch.einsum("qhd,khd->qhk", query.float(), key_full.float())
+    scores /= head_size**0.5
+    if causal:
+        # The last num_q positions of K correspond to the Q tokens. A query
+        # at position i attends to keys [0 .. (num_kv - num_q + i)].
+        kv_positions = torch.arange(num_kv, device=query.device)
+        q_positions = torch.arange(num_q, device=query.device) + (num_kv - num_q)
+        # mask[i, j] = True where j > q_pos_i (future position)
+        mask = kv_positions.unsqueeze(0) > q_positions.unsqueeze(1)
+        scores = scores.masked_fill(
+            mask.unsqueeze(1),  # broadcast over heads
+            float("-inf"),
+        )
+    return torch.softmax(scores, dim=-1)
+
+
+def aggregate_per_block(
+    weights: torch.Tensor,
+    block_ids: torch.Tensor,
+    num_blocks: int,
+) -> torch.Tensor:
+    """Aggregate per-token attention weights into per-block sums.
+
+    Args:
+        weights: shape [num_q, num_heads, num_kv] from
+            compute_attention_weights.
+        block_ids: shape [num_kv], integer block id for each KV position.
+        num_blocks: total number of blocks the aggregation spans.
+
+    Returns:
+        shape [num_q, num_blocks] in float32: total attention from each query
+        to each block, averaged across heads. This is the per-block signal
+        the EVOKE scorer consumes.
+    """
+    num_q, num_heads, num_kv = weights.shape
+    head_avg = weights.mean(dim=1)  # [num_q, num_kv]
+    out = torch.zeros(num_q, num_blocks, dtype=head_avg.dtype, device=weights.device)
+    out.scatter_add_(1, block_ids.unsqueeze(0).expand(num_q, -1), head_avg)
+    return out
 
 
 @dataclass
@@ -92,11 +170,22 @@ def maybe_capture(
     query: torch.Tensor,
     key: torch.Tensor | None,
     value: torch.Tensor | None,
+    key_full: torch.Tensor | None = None,
+    causal: bool = True,
 ) -> None:
     # Strict no-op for layers not registered for capture; the cost on the
-    # hot attention path is a single dict lookup under a lock.
+    # hot attention path is a single dict lookup under a lock. When the
+    # caller supplies key_full (the reconstruction of K from the paged KV
+    # cache for the active sequences), the softmax(Q @ K^T) weights are
+    # computed and stored on the record. Without key_full, only the shape
+    # metadata is recorded.
     if layer_name not in _STATE.enabled_layers:
         return
+    weights = (
+        compute_attention_weights(query, key_full, causal=causal)
+        if key_full is not None
+        else None
+    )
     with _STATE.lock:
         if layer_name not in _STATE.enabled_layers:
             return
@@ -105,4 +194,5 @@ def maybe_capture(
             key_shape=tuple(key.shape) if key is not None else (),
             value_shape=tuple(value.shape) if value is not None else (),
             decode_step=_STATE.decode_step,
+            weights=weights,
         )
