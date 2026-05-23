@@ -47,6 +47,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     resolve_kv_cache_block_sizes,
 )
+from vllm.v1.core.eviction_policy import EvokeRequestMeta
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import (
@@ -86,6 +87,31 @@ logger = init_logger(__name__)
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+
+def _evoke_register_request_meta(scheduler, request_id, meta_dict):
+    """Push per-request EVOKE metadata into the eviction policy at request
+    admission. No-op when no policy is installed or when the policy is not
+    EVOKE (e.g. default LRU). Failures are swallowed so a malformed
+    evoke_request_meta payload cannot break admission of unrelated traffic.
+    """
+    try:
+        block_pool = scheduler.kv_cache_manager.block_pool
+        policy = getattr(block_pool, "eviction_policy", None)
+        if policy is None or not hasattr(policy, "set_request_meta"):
+            return
+        if isinstance(meta_dict, EvokeRequestMeta):
+            meta_obj = meta_dict
+        else:
+            meta_obj = EvokeRequestMeta(
+                source_type=meta_dict.get("source_type"),
+                priority=float(meta_dict.get("priority", 1.0)),
+                pinned=bool(meta_dict.get("pinned", False)),
+            )
+        policy.set_request_meta(request_id, meta_obj)
+    except Exception:
+        # EVOKE meta is best-effort; never block a normal request.
+        pass
 
 
 class EngineCore:
@@ -360,6 +386,16 @@ class EngineCore:
             logger.warning(
                 "Got kv_transfer_params, but no KVConnector found. "
                 "Disabling KVTransfer for this request."
+            )
+
+        # EVOKE: register per-request metadata on the eviction policy so the
+        # _evoke_tag_blocks hook in single_type_kv_cache_manager picks up
+        # source_type / priority / pinned at block-allocation time. No-op when
+        # no EVOKE policy is installed (default LRU has no per-request
+        # concept) or when the request body did not include the field.
+        if request.evoke_request_meta is not None:
+            _evoke_register_request_meta(
+                self.scheduler, request.request_id, request.evoke_request_meta
             )
 
         self.scheduler.add_request(request)
