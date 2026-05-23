@@ -12,6 +12,7 @@ from vllm.v1.attention.evoke_attn_capture import (
     get_capture,
     is_enabled,
     maybe_capture,
+    reconstruct_key_full_paged,
     register_layer,
     unregister_layer,
 )
@@ -203,3 +204,68 @@ def test_maybe_capture_weights_none_without_key_full():
     record = get_capture("layer_20")
     assert record is not None
     assert record.weights is None
+
+
+def test_reconstruct_key_full_paged_contiguous_blocks():
+    # Build a key_cache where each block holds tokens with unique sentinel
+    # values, then verify reconstruction recovers them in logical order.
+    num_blocks = 4
+    block_size = 4
+    num_kv_heads = 2
+    head_size = 8
+    key_cache = torch.zeros(num_blocks, block_size, num_kv_heads, head_size)
+    for blk in range(num_blocks):
+        for off in range(block_size):
+            key_cache[blk, off, 0, 0] = blk * 10 + off  # sentinel
+
+    # Sequence of 10 tokens stored in blocks [2, 0, 1]: tokens
+    # 0..3 in block 2, 4..7 in block 0, 8..9 in block 1.
+    block_table_row = torch.tensor([2, 0, 1])
+    seq_len = 10
+    k_full = reconstruct_key_full_paged(key_cache, block_table_row, seq_len, block_size)
+
+    assert tuple(k_full.shape) == (10, 2, 8)
+    expected = [20, 21, 22, 23, 0, 1, 2, 3, 10, 11]
+    for i, sentinel in enumerate(expected):
+        assert k_full[i, 0, 0].item() == sentinel
+
+
+def test_reconstruct_key_full_paged_partial_last_block():
+    # seq_len is not a multiple of block_size; the gather still works.
+    num_blocks = 2
+    block_size = 4
+    key_cache = torch.zeros(num_blocks, block_size, 1, 1)
+    for blk in range(num_blocks):
+        for off in range(block_size):
+            key_cache[blk, off, 0, 0] = blk * 10 + off
+
+    block_table_row = torch.tensor([0, 1])
+    seq_len = 6
+    k_full = reconstruct_key_full_paged(key_cache, block_table_row, seq_len, block_size)
+
+    assert tuple(k_full.shape) == (6, 1, 1)
+    expected = [0, 1, 2, 3, 10, 11]
+    for i, sentinel in enumerate(expected):
+        assert k_full[i, 0, 0].item() == sentinel
+
+
+def test_reconstruct_key_full_paged_then_attention_roundtrip():
+    """End-to-end: reconstruct K_full from paged cache, then feed it into
+    compute_attention_weights. Validates the full capture pipeline minus
+    the hook wiring."""
+    num_blocks = 3
+    block_size = 4
+    num_kv_heads = 2
+    head_size = 8
+    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_size)
+
+    block_table_row = torch.tensor([0, 1, 2])
+    seq_len = 10
+    k_full = reconstruct_key_full_paged(key_cache, block_table_row, seq_len, block_size)
+    assert tuple(k_full.shape) == (seq_len, num_kv_heads, head_size)
+
+    # Decode-step query: 1 new token, num_heads = 2 (matching num_kv_heads here)
+    query = torch.randn(1, num_kv_heads, head_size)
+    weights = compute_attention_weights(query, k_full, causal=False)
+    assert tuple(weights.shape) == (1, num_kv_heads, seq_len)
+    assert torch.allclose(weights.sum(dim=-1), torch.ones(1, num_kv_heads), atol=1e-5)

@@ -41,6 +41,41 @@ class CaptureRecord:
     weights: torch.Tensor | None = None
 
 
+def reconstruct_key_full_paged(
+    key_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    seq_len: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Reconstruct K_full for one sequence from a paged KV cache.
+
+    vLLM stores K in pages of `block_size` tokens, indexed by per-sequence
+    block_table rows. For position i in [0, seq_len) the physical block id
+    is block_table_row[i // block_size] and the within-block offset is
+    i % block_size. This function gathers those positions into a contiguous
+    [seq_len, num_kv_heads, head_size] tensor suitable for the attention
+    side-compute.
+
+    Args:
+        key_cache: shape [num_blocks, block_size, num_kv_heads, head_size]
+            (the K half of the per-layer paged KV cache).
+        block_table_row: shape [num_pages_for_this_seq], physical block ids
+            for the sequence's logical pages.
+        seq_len: number of valid tokens in this sequence.
+        block_size: page size in tokens.
+
+    Returns:
+        shape [seq_len, num_kv_heads, head_size].
+    """
+    device = key_cache.device
+    positions = torch.arange(seq_len, device=device)
+    page_idx = positions // block_size
+    intra_offset = positions % block_size
+    # block_table_row may be longer than the number of pages we need.
+    physical_blocks = block_table_row[page_idx]
+    return key_cache[physical_blocks, intra_offset]
+
+
 def compute_attention_weights(
     query: torch.Tensor,
     key_full: torch.Tensor,
