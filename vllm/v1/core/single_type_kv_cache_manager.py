@@ -82,6 +82,20 @@ class SingleTypeKVCacheManager(ABC):
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
 
+    def _evoke_tag_blocks(self, blocks: list[KVCacheBlock], request_id: str) -> None:
+        """Tag freshly-allocated blocks with the EVOKE request_id so the
+        eviction policy can apply per-request source_type / priority /
+        pinned at scoring time. No-op when no policy is installed or when
+        the installed policy is the default LRU (which has no per-block
+        request tagging concept).
+        """
+        pol = getattr(self.block_pool, "eviction_policy", None)
+        if pol is None or not hasattr(pol, "assign_block_to_request"):
+            return
+        for block in blocks:
+            if not block.is_null:
+                pol.assign_block_to_request(block.block_id, request_id)
+
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
         return sum(blk.ref_cnt == 0 and not blk.is_null for blk in blocks)
@@ -217,6 +231,7 @@ class SingleTypeKVCacheManager(ABC):
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
             self.block_pool.touch(new_computed_blocks)
+            self._evoke_tag_blocks(new_computed_blocks, request_id)
         else:
             assert not any(new_computed_blocks), (
                 "Computed blocks should be empty when prefix caching is disabled"
@@ -237,6 +252,7 @@ class SingleTypeKVCacheManager(ABC):
                 cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
             )
             req_blocks.extend(allocated_blocks)
+            self._evoke_tag_blocks(allocated_blocks, request_id)
             if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
@@ -265,6 +281,7 @@ class SingleTypeKVCacheManager(ABC):
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
+            self._evoke_tag_blocks(new_blocks, request_id)
             if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
@@ -1080,6 +1097,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     assert num_new_blocks <= self.num_speculative_blocks + 1
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
                 req_blocks.extend(new_blocks)
+                self._evoke_tag_blocks(new_blocks, request_id)
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]
 
