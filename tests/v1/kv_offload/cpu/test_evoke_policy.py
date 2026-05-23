@@ -279,3 +279,102 @@ def test_select_for_recovery_skips_candidates_without_embedding():
     )
     keys = [k for k, _ in selected]
     assert keys == [b"with_emb"]
+
+
+def test_attention_score_protects_high_attention_block():
+    """When w_attention is enabled, a block with high attention should
+    outscore an otherwise-identical block with zero attention."""
+    policy = EvokeCachePolicy(cache_capacity=4)
+    policy.w_attention = 1.0
+    policy.w_recency = 0.0  # isolate the attention signal
+    policy.insert(b"high_attn", _make_block(0))
+    policy.insert(b"low_attn", _make_block(1))
+    policy.set_attention_score(b"high_attn", 0.8)
+    policy.set_attention_score(b"low_attn", 0.1)
+
+    evicted = policy.evict(n=1, protected=set())
+    assert evicted is not None
+    assert evicted[0][0] == b"low_attn"
+
+
+def test_coherence_score_set_and_used():
+    """When w_coherence is enabled and coherence_score is set, a block with
+    high coherence (semantically aligned with the current task focus)
+    survives an older block with low coherence."""
+    policy = EvokeCachePolicy(cache_capacity=4)
+    policy.w_recency = 0.0
+    policy.w_coherence = 1.0
+    policy.insert(b"on_topic", _make_block(0))
+    policy.insert(b"off_topic", _make_block(1))
+    policy.set_coherence_score(b"on_topic", 0.9)
+    policy.set_coherence_score(b"off_topic", 0.1)
+
+    evicted = policy.evict(n=1, protected=set())
+    assert evicted is not None
+    assert evicted[0][0] == b"off_topic"
+
+
+def test_set_recovery_strength_round_trip():
+    policy = EvokeCachePolicy(cache_capacity=4)
+    policy.insert(b"a", _make_block(0))
+    policy.set_recovery_strength(b"a", 1.0)
+    assert policy.meta[b"a"].recovery_strength == 1.0
+
+
+def test_decay_recovery_strength_applies_to_all_blocks():
+    """Per-turn decay multiplies every block's recovery_strength by the
+    decay factor. Used by the orchestrator at user-turn boundary so a
+    freshly-recovered block fades back to ordinary candidate status over
+    a handful of turns."""
+    policy = EvokeCachePolicy(cache_capacity=4)
+    policy.insert(b"a", _make_block(0))
+    policy.insert(b"b", _make_block(1))
+    policy.set_recovery_strength(b"a", 1.0)
+    policy.set_recovery_strength(b"b", 0.5)
+
+    policy.decay_recovery_strength(0.7)
+    assert abs(policy.meta[b"a"].recovery_strength - 0.7) < 1e-6
+    assert abs(policy.meta[b"b"].recovery_strength - 0.35) < 1e-6
+
+
+def test_update_attention_scores_bulk():
+    """The orchestrator pushes per-block attention scores after each
+    capture step; the bulk update silently skips keys that have been
+    evicted in the meantime."""
+    policy = EvokeCachePolicy(cache_capacity=4)
+    policy.insert(b"resident", _make_block(0))
+    policy.insert(b"also_resident", _make_block(1))
+
+    policy.update_attention_scores(
+        {
+            b"resident": 0.8,
+            b"also_resident": 0.4,
+            b"already_evicted": 0.9,  # silently dropped
+        }
+    )
+
+    assert policy.meta[b"resident"].attention_score == 0.8
+    assert policy.meta[b"also_resident"].attention_score == 0.4
+    assert b"already_evicted" not in policy.meta
+
+
+def test_multi_signal_recipe_full_score():
+    """End-to-end recipe check: with the recommended w_attention=0.5,
+    w_recency=0.2, w_coherence=0.3 weights and all three signals present,
+    the policy should pick the lowest combined-score block."""
+    policy = EvokeCachePolicy(cache_capacity=4)
+    policy.w_attention = 0.5
+    policy.w_recency = 0.2
+    policy.w_coherence = 0.3
+    policy.insert(b"winner", _make_block(0))
+    policy.insert(b"loser", _make_block(1))
+    # winner: low recency (older) but high attention + coherence
+    policy.set_attention_score(b"winner", 0.9)
+    policy.set_coherence_score(b"winner", 0.9)
+    # loser: high recency (newest) but low attention + coherence
+    policy.set_attention_score(b"loser", 0.1)
+    policy.set_coherence_score(b"loser", 0.0)
+
+    evicted = policy.evict(n=1, protected=set())
+    assert evicted is not None
+    assert evicted[0][0] == b"loser"

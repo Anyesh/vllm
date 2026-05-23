@@ -25,6 +25,14 @@ class EvokeBlockMeta:
     source_type: str | None = None
     pinned: bool = False
     embedding: np.ndarray | None = field(default=None, repr=False)
+    # Attention-mass signal: aggregated per-block attention from the
+    # capture layer's softmax(QK^T). Stays at 0.0 until the
+    # capture-orchestrator pushes values in.
+    attention_score: float = 0.0
+    # Coherence: cosine similarity of this block's embedding to the
+    # current task-focus embedding. Stays at 0.0 until the orchestrator
+    # pushes values in at turn boundary.
+    coherence_score: float = 0.0
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -58,6 +66,12 @@ class EvokeCachePolicy(CachePolicy):
         self.blocks: dict[OffloadKey, BlockStatus] = {}
         self.meta: dict[OffloadKey, EvokeBlockMeta] = {}
         self._tick: int = 0
+        # Default recipe is the fork-independent fallback: recency + coherence
+        # carry the score, attention and recovery are reserved. Deployments
+        # with the attention-capture path wired in should set
+        # w_attention=0.5, w_recency=0.2, w_coherence=0.3 as the recommended
+        # multi-signal config.
+        self.w_attention: float = 0.0
         self.w_recency: float = 0.4
         self.w_coherence: float = 0.6
         self.w_recovery: float = 0.0
@@ -75,10 +89,12 @@ class EvokeCachePolicy(CachePolicy):
     def _score(self, key: OffloadKey) -> float:
         meta = self.meta[key]
         recency = self._recency(key)
-        coherence = 0.0
+        attention = meta.attention_score
+        coherence = meta.coherence_score
         recovery = meta.recovery_strength
         raw = (
-            self.w_recency * recency
+            self.w_attention * attention
+            + self.w_recency * recency
             + self.w_coherence * coherence
             + self.w_recovery * recovery
         )
@@ -149,6 +165,38 @@ class EvokeCachePolicy(CachePolicy):
     def get_embedding(self, key: OffloadKey) -> np.ndarray | None:
         meta = self.meta.get(key)
         return meta.embedding if meta is not None else None
+
+    def set_attention_score(self, key: OffloadKey, score: float) -> None:
+        if key in self.meta:
+            self.meta[key].attention_score = score
+
+    def set_coherence_score(self, key: OffloadKey, score: float) -> None:
+        if key in self.meta:
+            self.meta[key].coherence_score = score
+
+    def set_recovery_strength(self, key: OffloadKey, strength: float) -> None:
+        if key in self.meta:
+            self.meta[key].recovery_strength = strength
+
+    def decay_recovery_strength(self, decay: float) -> None:
+        """Apply per-turn decay to every block's recovery_strength.
+
+        Called by the orchestrator at the start of each user turn so a
+        freshly-recovered block survives one or two more eviction passes
+        before fading back to ordinary candidate status.
+        """
+        for meta in self.meta.values():
+            meta.recovery_strength *= decay
+
+    def update_attention_scores(self, scores: dict[OffloadKey, float]) -> None:
+        """Bulk update attention scores from the capture orchestrator.
+
+        Keys missing from the policy are silently ignored (the block may
+        have been evicted between capture and update).
+        """
+        for key, score in scores.items():
+            if key in self.meta:
+                self.meta[key].attention_score = score
 
     def select_for_recovery(
         self,
