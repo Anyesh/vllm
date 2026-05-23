@@ -62,6 +62,7 @@ __all__ = [
     "BlockEvictionPolicy",
     "EvokeBlockEvictionPolicy",
     "EvokeGpuBlockMeta",
+    "EvokeRequestMeta",
     "LRUBlockEvictionPolicy",
     "SOURCE_ASSISTANT",
     "SOURCE_DOCUMENT",
@@ -149,6 +150,21 @@ class EvokeGpuBlockMeta:
     source_type: str | None = None
     pinned: bool = False
     embedding: np.ndarray | None = field(default=None, repr=False)
+    request_id: str | None = None
+
+
+@dataclass
+class EvokeRequestMeta:
+    """Per-request EVOKE metadata extracted from the OpenAI-compatible
+    request body's `vllm_xargs.evoke_request_meta`. Applied to every
+    block allocated for the request at on_block_freed time so source-type
+    floors, harness priority, and pinning take effect without further
+    plumbing through the scheduler hot path.
+    """
+
+    source_type: str | None = None
+    priority: float = 1.0
+    pinned: bool = False
 
 
 class EvokeBlockEvictionPolicy(BlockEvictionPolicy):
@@ -178,6 +194,11 @@ class EvokeBlockEvictionPolicy(BlockEvictionPolicy):
             SOURCE_ASSISTANT: 0.5,
             SOURCE_SYSTEM: 0.6,
         }
+        # Per-request metadata pushed in by the caller (e.g. via the
+        # ChatCompletionRequest extension path). Looked up when a block is
+        # assigned to a request so source_type / priority / pinned can be
+        # applied without further hot-path plumbing.
+        self.request_meta: dict[str, EvokeRequestMeta] = {}
 
     def _ensure_meta(self, block_id: int) -> EvokeGpuBlockMeta:
         meta = self.meta.get(block_id)
@@ -268,6 +289,29 @@ class EvokeBlockEvictionPolicy(BlockEvictionPolicy):
     def get_embedding(self, block_id: int) -> np.ndarray | None:
         meta = self.meta.get(block_id)
         return meta.embedding if meta is not None else None
+
+    def set_request_meta(self, request_id: str, meta: EvokeRequestMeta) -> None:
+        """Register per-request EVOKE metadata. The scheduler / kv_cache
+        manager calls `assign_block_to_request` for each block allocated
+        on behalf of the request; from then on the block inherits this
+        request's source_type / priority / pinned at scoring time."""
+        self.request_meta[request_id] = meta
+
+    def drop_request_meta(self, request_id: str) -> None:
+        self.request_meta.pop(request_id, None)
+
+    def assign_block_to_request(self, block_id: int, request_id: str) -> None:
+        """Tag a freshly-allocated block as belonging to a request. Applies
+        the request's EvokeRequestMeta (if registered) to the block's
+        per-block meta so eviction scoring picks up source_type/priority/
+        pinned. Called by the kv_cache_manager at block-allocation time."""
+        block_meta = self._ensure_meta(block_id)
+        block_meta.request_id = request_id
+        req_meta = self.request_meta.get(request_id)
+        if req_meta is not None:
+            block_meta.source_type = req_meta.source_type
+            block_meta.priority = req_meta.priority
+            block_meta.pinned = req_meta.pinned
 
     def decay_recovery_strength(self, decay: float) -> None:
         for meta in self.meta.values():

@@ -100,6 +100,12 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        # EVOKE per-request metadata (source_type, priority, pinned) pulled
+        # from sampling_params.extra_args["evoke_request_meta"]. The
+        # scheduler's kv_cache_manager calls
+        # EvokeBlockEvictionPolicy.set_request_meta with this at request
+        # admission, then assign_block_to_request as blocks are allocated.
+        self.evoke_request_meta: dict[str, Any] | None = None
 
         if pooling_params is not None:
             # Pooling models.
@@ -114,6 +120,9 @@ class Request:
             if sampling_params.extra_args is not None:
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
+                )
+                self.evoke_request_meta = sampling_params.extra_args.get(
+                    "evoke_request_meta"
                 )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")

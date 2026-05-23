@@ -6,8 +6,10 @@ import numpy as np
 
 from vllm.v1.core.eviction_policy import (
     SOURCE_ASSISTANT,
+    SOURCE_DOCUMENT,
     SOURCE_USER,
     EvokeBlockEvictionPolicy,
+    EvokeRequestMeta,
     LRUBlockEvictionPolicy,
 )
 
@@ -243,6 +245,78 @@ def test_evoke_multi_signal_recommended_recipe():
     policy.set_coherence_score(0, 0.9)
     policy.set_attention_score(1, 0.1)
     policy.set_coherence_score(1, 0.0)
+
+    chosen = policy.select_eviction_candidates(n=1, protected=set())
+    assert chosen is not None
+    assert chosen[0].block_id == 1
+
+
+def test_request_meta_round_trip():
+    policy = EvokeBlockEvictionPolicy()
+    meta = EvokeRequestMeta(source_type=SOURCE_USER, priority=2.0, pinned=False)
+    policy.set_request_meta("req-1", meta)
+    assert policy.request_meta["req-1"] is meta
+    policy.drop_request_meta("req-1")
+    assert "req-1" not in policy.request_meta
+
+
+def test_assign_block_to_request_applies_meta():
+    policy = EvokeBlockEvictionPolicy()
+    policy.set_request_meta(
+        "req-1",
+        EvokeRequestMeta(source_type=SOURCE_USER, priority=3.0, pinned=False),
+    )
+    policy.on_block_freed(_block(0))
+    policy.assign_block_to_request(0, "req-1")
+
+    assert policy.meta[0].source_type == SOURCE_USER
+    assert policy.meta[0].priority == 3.0
+    assert policy.meta[0].request_id == "req-1"
+
+
+def test_assign_block_to_request_without_meta_leaves_defaults():
+    """Assigning a block to a request whose meta is not yet registered
+    sets the block's request_id but leaves source_type/priority/pinned
+    at defaults. The harness may register the request meta after blocks
+    are allocated for early prefill, or never register meta at all."""
+    policy = EvokeBlockEvictionPolicy()
+    policy.on_block_freed(_block(0))
+    policy.assign_block_to_request(0, "req-2")
+    assert policy.meta[0].request_id == "req-2"
+    assert policy.meta[0].source_type is None
+    assert policy.meta[0].priority == 1.0
+    assert not policy.meta[0].pinned
+
+
+def test_request_meta_drives_eviction_via_floor():
+    """End-to-end: a user-source request's blocks should outlive a
+    document-source request's blocks even when both are similarly aged,
+    because the user floor (0.6) is higher than what document blocks
+    score from raw recency."""
+    policy = EvokeBlockEvictionPolicy()
+    policy.set_request_meta("user-req", EvokeRequestMeta(source_type=SOURCE_USER))
+    policy.set_request_meta("doc-req", EvokeRequestMeta(source_type=SOURCE_DOCUMENT))
+    policy.on_block_freed(_block(0))
+    policy.on_block_freed(_block(1))
+    policy.assign_block_to_request(0, "user-req")
+    policy.assign_block_to_request(1, "doc-req")
+    for _ in range(200):
+        policy._tick += 1
+
+    chosen = policy.select_eviction_candidates(n=1, protected=set())
+    assert chosen is not None
+    assert chosen[0].block_id == 1
+
+
+def test_request_meta_pinned_prevents_eviction():
+    policy = EvokeBlockEvictionPolicy()
+    policy.set_request_meta(
+        "pinned-req",
+        EvokeRequestMeta(source_type=SOURCE_USER, priority=1.0, pinned=True),
+    )
+    policy.on_block_freed(_block(0))
+    policy.on_block_freed(_block(1))
+    policy.assign_block_to_request(0, "pinned-req")
 
     chosen = policy.select_eviction_candidates(n=1, protected=set())
     assert chosen is not None
