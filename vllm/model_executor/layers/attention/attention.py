@@ -31,6 +31,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
+from vllm.v1.attention.evoke_attn_capture import maybe_capture as _evoke_maybe_capture
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
@@ -486,6 +487,9 @@ class Attention(nn.Module, AttentionLayerBase):
             key = key.view(-1, self.num_kv_heads, self.head_size)
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
+        # EVOKE attention-weight capture: no-op for layers not registered.
+        # See vllm/v1/attention/evoke_attn_capture.py.
+        _evoke_maybe_capture(self.layer_name, query, key, value)
         kv_cache_dummy_dep = None
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
