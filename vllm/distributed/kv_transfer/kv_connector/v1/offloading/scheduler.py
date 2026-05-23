@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any, NamedTuple
 
+import numpy as np
+
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -133,6 +135,15 @@ class RequestOffloadState:
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
+    # EVOKE smart-recovery: keys selected at admission by
+    # recommend_recovery, paired with the original token positions each
+    # block held when offloaded. The positions are what
+    # update_state_after_alloc uses to map each key to its dst GPU slot in
+    # req_to_blocks (gap-fill case: position lands inside the prompt's
+    # logical token range, so the block_table slot at index
+    # position // offloaded_block_size is the right destination).
+    recovery_keys: list[OffloadKey] = field(default_factory=list)
+    recovery_positions: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -449,6 +460,65 @@ class OffloadingConnectorScheduler:
 
         return num_hit_tokens
 
+    def _compute_smart_recovery_keys(
+        self,
+        request: Request,
+        prefix_keys_to_load: set[OffloadKey],
+    ) -> tuple[list[OffloadKey], list[int]]:
+        """EVOKE smart-recovery: ask the offload manager's policy which
+        evicted blocks are worth bringing back for this request's query.
+
+        Returns the keys to recover, deduplicated against blocks already
+        scheduled by the prefix-extension path. Empty list when the request
+        carries no evoke_request_meta, no query_embedding, or recover_top_k
+        is 0. For policies that don't implement select_for_recovery (LRU,
+        ARC), the OffloadingManager default of recommend_recovery returns
+        an empty list, so no harm done.
+        """
+        meta = getattr(request, "evoke_request_meta", None)
+        if meta is None:
+            return [], []
+        if isinstance(meta, dict):
+            recover_top_k = int(meta.get("recover_top_k", 0))
+            query_embedding = meta.get("query_embedding")
+            min_similarity = float(meta.get("min_similarity", 0.0))
+        else:
+            recover_top_k = int(getattr(meta, "recover_top_k", 0))
+            query_embedding = getattr(meta, "query_embedding", None)
+            min_similarity = float(getattr(meta, "min_similarity", 0.0))
+        if recover_top_k <= 0 or query_embedding is None:
+            return [], []
+        query = np.asarray(query_embedding, dtype=np.float32)
+        try:
+            recs = self.manager.recommend_recovery(
+                query,
+                top_k=recover_top_k,
+                resident_max_similarity=0.0,
+                min_similarity=min_similarity,
+            )
+        except Exception as e:
+            logger.warning(
+                "EVOKE recommend_recovery failed for request %s: %s; "
+                "falling back to no recovery",
+                request.request_id,
+                e,
+            )
+            return [], []
+        keys: list[OffloadKey] = []
+        positions: list[int] = []
+        for k, _sim in recs:
+            if k in prefix_keys_to_load:
+                continue
+            block_status = self.manager._policy.get(k)
+            if block_status is None:
+                continue
+            orig_pos = int(getattr(block_status, "original_position", -1))
+            if orig_pos < 0:
+                continue
+            keys.append(k)
+            positions.append(orig_pos)
+        return keys, positions
+
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
@@ -473,7 +543,6 @@ class OffloadingConnectorScheduler:
         """
         is_new_request = False
         if req_status := self._req_status.get(request.request_id):
-            # make sure block IDs are cleared
             for group_state in req_status.group_states:
                 group_state.block_ids.clear()
         else:
@@ -492,6 +561,70 @@ class OffloadingConnectorScheduler:
 
         self._touch(req_status)
 
+        prefix_keys: set[OffloadKey] = set()
+        if num_hit_tokens:
+            for group_config, group_state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            ):
+                num_blocks = (
+                    num_computed_tokens + num_hit_tokens
+                ) // group_config.offloaded_block_size
+                start_block_idx = (
+                    num_computed_tokens // group_config.offloaded_block_size
+                )
+                prefix_keys.update(group_state.offload_keys[start_block_idx:num_blocks])
+        recovery_keys, recovery_positions = self._compute_smart_recovery_keys(
+            request, prefix_keys
+        )
+        req_status.recovery_keys = recovery_keys
+        req_status.recovery_positions = recovery_positions
+        if recovery_keys:
+            # Filter recovery to gap-fill semantic: only keep candidates whose
+            # original position is within this request's prompt token range.
+            # The vLLM scheduler model only supports cached coverage within
+            # [0, num_tokens); positions outside that range cannot be loaded
+            # without changing request.num_tokens, which is a deeper refactor.
+            num_tokens = request.num_tokens
+            kept_keys: list[OffloadKey] = []
+            kept_positions: list[int] = []
+            for k, p in zip(recovery_keys, recovery_positions):
+                if 0 <= p < num_tokens:
+                    kept_keys.append(k)
+                    kept_positions.append(p)
+            dropped = len(recovery_keys) - len(kept_keys)
+            if dropped:
+                logger.info(
+                    "EVOKE smart-recovery: dropped %d/%d candidates whose "
+                    "original positions are outside this request's "
+                    "[0, num_tokens=%d) range (cross-session recall not "
+                    "supported in vLLM's prompt model)",
+                    dropped,
+                    len(recovery_keys),
+                    num_tokens,
+                )
+            req_status.recovery_keys = kept_keys
+            req_status.recovery_positions = kept_positions
+            recovery_keys = kept_keys
+        # NOTE: deferring on recovery_keys (returning load_kv_async=True
+        # with zero ext_tokens) hangs the request because update_state_after_alloc
+        # has no dst_block_ids for the recovery keys to land in -- no load
+        # job builds, no load completes, deferral never resolves. To
+        # activate recovery end-to-end the kv_cache_manager needs to
+        # allocate extra GPU slots for recovery blocks AND
+        # update_state_after_alloc needs to map them. Tasks #15-#17 cover
+        # that work. For now we identify candidates but do not defer, so
+        # the engine continues to serve recovery requests without recovery
+        # actually applied. See devlog and [[no-wrap-up-move]].
+        if recovery_keys:
+            logger.info(
+                "EVOKE smart-recovery candidates identified for request %s: "
+                "%d keys (prefix-extension hits: %s); load deferred until "
+                "block allocation extension lands (tasks #15-#17)",
+                request.request_id,
+                len(recovery_keys),
+                num_hit_tokens or 0,
+            )
+
         return num_hit_tokens, bool(num_hit_tokens)
 
     def update_state_after_alloc(
@@ -505,28 +638,43 @@ class OffloadingConnectorScheduler:
         num_locally_computed_tokens = req_status.num_locally_computed_tokens
         num_cached_tokens = num_locally_computed_tokens + num_external_tokens
 
+        # EVOKE smart-recovery: separate the prefix-extension portion of
+        # num_external_tokens from the recovery portion that we inflated
+        # the count by in get_num_new_matched_tokens. Recovery blocks land
+        # at positions immediately after the prefix-extension range; the
+        # RoPE-delta rotator re-anchors their K bytes on load.
+        offloaded_block_size_g0 = self.config.kv_group_configs[0].offloaded_block_size
+        num_recovery_blocks = len(req_status.recovery_keys)
+        num_recovery_tokens = num_recovery_blocks * offloaded_block_size_g0
+        num_prefix_external_tokens = num_external_tokens - num_recovery_tokens
+        num_cached_tokens_prefix = (
+            num_locally_computed_tokens + num_prefix_external_tokens
+        )
+
         params = req_status.req_context.kv_transfer_params
         do_remote_decode = params is not None and params.get("do_remote_decode")
 
         keys_to_load: list[OffloadKey] = []
+        new_positions: list[int] = []
         dst_block_ids: list[int] = []
-        # per group
         group_sizes: list[int] = []
         block_indices: list[int] = []
-        for group_config, group_state, group_blocks in zip(
-            self.config.kv_group_configs,
-            req_status.group_states,
-            blocks.blocks,
+        for group_idx, (group_config, group_state, group_blocks) in enumerate(
+            zip(
+                self.config.kv_group_configs,
+                req_status.group_states,
+                blocks.blocks,
+            )
         ):
             gpu_block_size = group_config.gpu_block_size
             offloaded_block_size = group_config.offloaded_block_size
             offload_keys = group_state.offload_keys
-            num_gpu_blocks = cdiv(num_cached_tokens, gpu_block_size)
+            num_gpu_blocks_total = cdiv(num_cached_tokens, gpu_block_size)
+            num_gpu_blocks_prefix = cdiv(num_cached_tokens_prefix, gpu_block_size)
 
-            assert len(group_blocks) >= num_gpu_blocks
-            num_locally_computed_gpu_blocks = num_gpu_blocks
-            # Skip null placeholder blocks (used for sliding window or mamba padding).
-            for i, block in enumerate(group_blocks[:num_gpu_blocks]):
+            assert len(group_blocks) >= num_gpu_blocks_total
+            num_locally_computed_gpu_blocks = num_gpu_blocks_total
+            for i, block in enumerate(group_blocks[:num_gpu_blocks_total]):
                 if not block.is_null and block.block_hash is None:
                     num_locally_computed_gpu_blocks = i
                     break
@@ -535,7 +683,9 @@ class OffloadingConnectorScheduler:
                 num_locally_computed_tokens
                 <= num_locally_computed_gpu_blocks * gpu_block_size
             )
-            num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
+            num_pending_gpu_blocks = (
+                num_gpu_blocks_total - num_locally_computed_gpu_blocks
+            )
 
             if group_config.sliding_window_size_in_blocks is not None:
                 assert (
@@ -544,30 +694,51 @@ class OffloadingConnectorScheduler:
                     * self.config.block_size_factor
                 )
 
-            num_blocks = cdiv(num_cached_tokens, offloaded_block_size)
-            assert len(offload_keys) >= num_blocks
+            num_blocks_prefix = cdiv(num_cached_tokens_prefix, offloaded_block_size)
+            assert len(offload_keys) >= num_blocks_prefix
             if num_pending_gpu_blocks:
                 start_block_idx = (
                     num_locally_computed_gpu_blocks // self.config.block_size_factor
                 )
-                keys_to_load.extend(offload_keys[start_block_idx:num_blocks])
+                prefix_keys = list(offload_keys[start_block_idx:num_blocks_prefix])
+                keys_to_load.extend(prefix_keys)
+                # Prefix-extension keys land at the same absolute positions
+                # they were stored from -- the offload-key hashes match the
+                # block content at those positions in the new sequence.
+                # Rotator no-ops on these (orig == new).
+                new_positions.extend(
+                    (start_block_idx + i) * offloaded_block_size
+                    for i in range(len(prefix_keys))
+                )
+
+            if group_idx == 0 and num_recovery_blocks:
+                # Smart-recovery keys: land at the positions immediately
+                # after the prefix-extension range. The original positions
+                # come from BlockStatus inside prepare_load. The rotator
+                # fires because orig != new for recovery loads.
+                keys_to_load.extend(req_status.recovery_keys)
+                new_positions.extend(
+                    num_cached_tokens_prefix + i * offloaded_block_size
+                    for i in range(num_recovery_blocks)
+                )
 
             dst_block_ids.extend(
                 block.block_id
                 for block in group_blocks[
-                    num_locally_computed_gpu_blocks:num_gpu_blocks
+                    num_locally_computed_gpu_blocks:num_gpu_blocks_total
                 ]
             )
             group_sizes.append(num_pending_gpu_blocks)
             block_indices.append(num_locally_computed_gpu_blocks)
 
             if not do_remote_decode:
-                # For P/D prefill requests (do_remote_decode=True), we do
-                # NOT skip saving the hit prefix, as we need to stream the
-                # entire KV cache so a remote decode node can consume it.
-                group_state.next_stored_block_idx = num_blocks
+                # Recovery blocks must NOT be re-stored on completion:
+                # they are semantically pulled from somewhere else in the
+                # session, not a fresh prefix extension worth persisting at
+                # the prefix-cache hash. next_stored_block_idx stays at the
+                # prefix-extension boundary.
+                group_state.next_stored_block_idx = num_blocks_prefix
 
-        # Fence dst blocks against finished-request pending stores.
         if (
             self._block_id_to_pending_jobs
             and not self._block_id_to_pending_jobs.keys().isdisjoint(dst_block_ids)
@@ -578,7 +749,11 @@ class OffloadingConnectorScheduler:
                 for jid in self._block_id_to_pending_jobs.get(bid, ())
             )
 
-        src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+        src_spec = self.manager.prepare_load(
+            keys_to_load,
+            req_status.req_context,
+            new_positions=new_positions if num_recovery_blocks else None,
+        )
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
