@@ -94,12 +94,12 @@ def verify_events(
     assert tuple(stores) == to_key_sets(expected_stores)
 
 
-@pytest.mark.parametrize("eviction_policy", ["lru", "arc"])
+@pytest.mark.parametrize("eviction_policy", ["lru", "arc", "evoke"])
 def test_already_stored_block_not_evicted_during_prepare_store(eviction_policy):
     """
     Regression test: a block that is already stored must not be evicted
     by prepare_store() when it needs to make room for new blocks.
-    Applies to both lru and arc policies.
+    Applies to lru, arc, and evoke policies.
 
     Scenario:
         - Store blocks [1, 2] and complete.
