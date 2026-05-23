@@ -129,6 +129,7 @@ class OffloadingManager(ABC):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        new_positions: Sequence[int] | None = None,
     ) -> LoadStoreSpec:
         """
         Prepare the given blocks to be read.
@@ -139,6 +140,12 @@ class OffloadingManager(ABC):
         Args:
             keys: the keys identifying the blocks.
             req_context: per-request context (e.g. kv_transfer_params).
+            new_positions: optional per-key absolute token positions the
+                blocks will occupy in the destination sequence. Used by
+                EVOKE smart-recovery: when a block lands at a different
+                position than where it was offloaded, the worker applies a
+                RoPE delta on load. None preserves legacy behavior (no
+                rotation).
 
         Returns:
             A LoadStoreSpec that can be used by a worker to locate and load
@@ -172,6 +179,7 @@ class OffloadingManager(ABC):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        original_positions: Sequence[int] | None = None,
     ) -> PrepareStoreOutput | None:
         """
         Prepare the given blocks to be offloaded.
@@ -181,6 +189,10 @@ class OffloadingManager(ABC):
         Args:
             keys: the keys identifying the blocks.
             req_context: per-request context (e.g. kv_transfer_params).
+            original_positions: optional per-key absolute token positions
+                (first token of the block in the source sequence) used by
+                EVOKE smart-recovery so the worker can RoPE re-anchor on
+                load. Must align with `keys` by index when supplied.
 
         Returns:
             A PrepareStoreOutput indicating which blocks need storing,
@@ -225,6 +237,30 @@ class OffloadingManager(ABC):
     def shutdown(self) -> None:
         """Shutdown the manager and release any resources."""
         return
+
+    def recommend_recovery(
+        self,
+        query_embedding: "np.ndarray",
+        top_k: int,
+        resident_max_similarity: float = 0.0,
+        min_similarity: float = 0.0,
+    ) -> list[tuple[OffloadKey, float]]:
+        """Recommend offloaded blocks worth bringing back for a new user turn.
+
+        The default returns no recommendations because LRU and ARC have no
+        semantic signal: they cannot beat a resident block by similarity to
+        a query. The EVOKE policy overrides this in CPUOffloadingManager by
+        delegating to `EvokeCachePolicy.select_for_recovery`, which ranks
+        candidates by cosine similarity gated against
+        `resident_max_similarity` so off-topic recalls cannot pollute the
+        cache.
+
+        Callers wire this into request admission: the connector scheduler
+        sees a new user turn carrying a query_embedding, asks here for keys
+        to pre-load before the request starts decoding, and the model sees
+        the recovered blocks resident instead of evicted.
+        """
+        return []
 
 
 class BlockIDsLoadStoreSpec(LoadStoreSpec, ABC):

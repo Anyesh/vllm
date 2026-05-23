@@ -15,15 +15,26 @@ class BlockStatus(ctypes.Structure):
     ref_cnt - the current number of transfers using this block as a source.
         A value of -1 indicates the block is not yet ready to be read.
     block_id - index of the physical CPU buffer slot.
+    original_position - absolute token index of the block's first token at
+        the time it was offloaded. Used by EVOKE smart-recovery for RoPE
+        re-anchoring on load: when this block is brought back at a different
+        sequence position, the worker applies a RoPE delta so the cached K
+        bytes align with the new absolute position. A value of -1 means the
+        position is unknown (legacy stores written before position tracking
+        landed, or non-EVOKE policies that don't need recovery).
     """
 
-    _fields_ = [("ref_cnt", ctypes.c_int32), ("block_id", ctypes.c_int64)]
+    _fields_ = [
+        ("ref_cnt", ctypes.c_int32),
+        ("block_id", ctypes.c_int64),
+        ("original_position", ctypes.c_int64),
+    ]
 
-    def __init__(self, block_id: int):
+    def __init__(self, block_id: int, original_position: int = -1):
         super().__init__()
-        # initialize block as "not ready" (ref_cnt = -1)
         self.ref_cnt = -1
         self.block_id = block_id
+        self.original_position = original_position
 
     @property
     def is_ready(self) -> bool:

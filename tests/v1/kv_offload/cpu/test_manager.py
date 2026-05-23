@@ -648,3 +648,132 @@ def test_filter_reused_manager():
     assert prepare_store_output.keys_to_store == []
 
     manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+
+
+def _store_with_embedding(
+    manager: CPUOffloadingManager,
+    key_int: int,
+    embedding: np.ndarray,
+) -> OffloadKey:
+    key = to_key(key_int)
+    out = manager.prepare_store([key], _EMPTY_REQ_CTX)
+    assert out is not None
+    manager.complete_store([key], _EMPTY_REQ_CTX, success=True)
+    manager._policy.set_embedding(key, embedding)
+    return key
+
+
+def test_recommend_recovery_default_policy_returns_empty():
+    manager = CPUOffloadingManager(num_blocks=4, cache_policy="lru")
+    query = np.array([1.0, 0.0], dtype=np.float32)
+    assert manager.recommend_recovery(query, top_k=4) == []
+
+
+def test_recommend_recovery_evoke_ranks_by_similarity():
+    manager = CPUOffloadingManager(num_blocks=4, cache_policy="evoke")
+    k_hit = _store_with_embedding(manager, 1, np.array([1.0, 0.0], dtype=np.float32))
+    k_strong = _store_with_embedding(manager, 2, np.array([0.9, 0.1], dtype=np.float32))
+    _store_with_embedding(manager, 3, np.array([0.0, 1.0], dtype=np.float32))
+
+    query = np.array([1.0, 0.0], dtype=np.float32)
+    recs = manager.recommend_recovery(query, top_k=2, resident_max_similarity=0.5)
+    keys = [k for k, _ in recs]
+    assert keys[0] == k_hit
+    assert keys[1] == k_strong
+    assert all(sim >= 0.5 for _, sim in recs)
+
+
+def test_recommend_recovery_respects_top_k_zero():
+    manager = CPUOffloadingManager(num_blocks=4, cache_policy="evoke")
+    _store_with_embedding(manager, 1, np.array([1.0, 0.0], dtype=np.float32))
+    query = np.array([1.0, 0.0], dtype=np.float32)
+    assert manager.recommend_recovery(query, top_k=0) == []
+
+
+def test_recommend_recovery_honors_resident_gate():
+    manager = CPUOffloadingManager(num_blocks=4, cache_policy="evoke")
+    _store_with_embedding(manager, 1, np.array([0.5, 0.5], dtype=np.float32))
+    query = np.array([1.0, 0.0], dtype=np.float32)
+    recs = manager.recommend_recovery(query, top_k=4, resident_max_similarity=0.9)
+    assert recs == []
+
+
+def test_prepare_store_persists_original_positions():
+    """EVOKE smart-recovery needs the absolute token position the block held
+    at offload time so the worker can RoPE re-anchor on load. Verify that
+    prepare_store's original_positions arg ends up on the policy's BlockStatus
+    entries, aligned by key."""
+    manager = CPUOffloadingManager(num_blocks=4, cache_policy="evoke")
+    keys = to_keys([10, 20, 30])
+    positions = [0, 64, 128]
+    out = manager.prepare_store(keys, _EMPTY_REQ_CTX, original_positions=positions)
+    assert out is not None
+    manager.complete_store(keys, _EMPTY_REQ_CTX, success=True)
+    for key, expected_pos in zip(keys, positions):
+        block = manager._policy.get(key)
+        assert block is not None
+        assert block.original_position == expected_pos, (
+            f"key {key!r}: expected position {expected_pos}, got "
+            f"{block.original_position}"
+        )
+
+
+def test_prepare_store_defaults_position_to_minus_one_when_unspecified():
+    manager = CPUOffloadingManager(num_blocks=4, cache_policy="evoke")
+    keys = to_keys([10, 20])
+    out = manager.prepare_store(keys, _EMPTY_REQ_CTX)
+    assert out is not None
+    manager.complete_store(keys, _EMPTY_REQ_CTX, success=True)
+    for key in keys:
+        block = manager._policy.get(key)
+        assert block is not None
+        assert block.original_position == -1
+
+
+def test_prepare_store_position_alignment_assertion():
+    """Mismatched lengths must raise a clear error rather than silently mis-
+    align positions to keys, which would corrupt the RoPE re-anchor on load."""
+    manager = CPUOffloadingManager(num_blocks=4, cache_policy="evoke")
+    keys = to_keys([10, 20, 30])
+    with pytest.raises(AssertionError):
+        manager.prepare_store(keys, _EMPTY_REQ_CTX, original_positions=[0, 64])
+
+
+def test_prepare_load_populates_positions_when_new_positions_given():
+    """The load spec must carry both original_positions (from BlockStatus)
+    and new_positions (from caller) so the worker can compute the RoPE delta."""
+    manager = CPUOffloadingManager(num_blocks=4, cache_policy="evoke")
+    keys = to_keys([10, 20])
+    orig_positions = [0, 64]
+    out = manager.prepare_store(keys, _EMPTY_REQ_CTX, original_positions=orig_positions)
+    assert out is not None
+    manager.complete_store(keys, _EMPTY_REQ_CTX, success=True)
+
+    new_positions = [256, 320]
+    spec = manager.prepare_load(keys, _EMPTY_REQ_CTX, new_positions=new_positions)
+    assert isinstance(spec, CPULoadStoreSpec)
+    assert list(spec.original_positions) == orig_positions
+    assert list(spec.new_positions) == new_positions
+
+
+def test_prepare_load_legacy_no_positions_defaults_to_minus_one():
+    """When new_positions is None (legacy callers, prefix-extension loads),
+    the spec arrays should be all -1 so the worker skips the rotation step."""
+    manager = CPUOffloadingManager(num_blocks=4, cache_policy="evoke")
+    keys = to_keys([10, 20])
+    manager.prepare_store(keys, _EMPTY_REQ_CTX, original_positions=[0, 64])
+    manager.complete_store(keys, _EMPTY_REQ_CTX, success=True)
+
+    spec = manager.prepare_load(keys, _EMPTY_REQ_CTX)
+    assert isinstance(spec, CPULoadStoreSpec)
+    assert list(spec.original_positions) == [-1, -1]
+    assert list(spec.new_positions) == [-1, -1]
+
+
+def test_prepare_load_new_positions_alignment_assertion():
+    manager = CPUOffloadingManager(num_blocks=4, cache_policy="evoke")
+    keys = to_keys([10, 20])
+    manager.prepare_store(keys, _EMPTY_REQ_CTX, original_positions=[0, 64])
+    manager.complete_store(keys, _EMPTY_REQ_CTX, success=True)
+    with pytest.raises(AssertionError):
+        manager.prepare_load(keys, _EMPTY_REQ_CTX, new_positions=[256])

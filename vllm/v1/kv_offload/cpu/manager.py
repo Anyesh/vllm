@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 from typing import Literal
+
+import numpy as np
 
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
@@ -68,20 +70,35 @@ class CPUOffloadingManager(OffloadingManager):
     def _get_num_free_blocks(self) -> int:
         return len(self._free_list) + self._num_blocks - self._num_allocated_blocks
 
-    def _allocate_blocks(self, keys: list[OffloadKey]) -> list[BlockStatus]:
+    def _allocate_blocks(
+        self,
+        keys: list[OffloadKey],
+        original_positions: Sequence[int] | None = None,
+    ) -> list[BlockStatus]:
         num_fresh = min(len(keys), self._num_blocks - self._num_allocated_blocks)
         num_reused = len(keys) - num_fresh
         assert len(self._free_list) >= num_reused
+        if original_positions is not None:
+            assert len(original_positions) == len(keys), (
+                "original_positions must align 1:1 with keys"
+            )
 
-        # allocate fresh blocks
+        def _pos(i: int) -> int:
+            return -1 if original_positions is None else int(original_positions[i])
+
         blocks: list[BlockStatus] = []
-        for _ in range(num_fresh):
-            blocks.append(BlockStatus(self._num_allocated_blocks))
+        for i in range(num_fresh):
+            blocks.append(
+                BlockStatus(self._num_allocated_blocks, original_position=_pos(i))
+            )
             self._num_allocated_blocks += 1
 
-        # allocate reused blocks
-        for _ in range(num_reused):
-            blocks.append(BlockStatus(self._free_list.pop()))
+        for j in range(num_reused):
+            blocks.append(
+                BlockStatus(
+                    self._free_list.pop(), original_position=_pos(num_fresh + j)
+                )
+            )
         return blocks
 
     def _free_block(self, block: BlockStatus) -> None:
@@ -91,8 +108,20 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         keys: Iterable[OffloadKey],
         blocks: Iterable[BlockStatus],
+        new_positions: Sequence[int] | None = None,
     ) -> CPULoadStoreSpec:
-        return CPULoadStoreSpec([block.block_id for block in blocks])
+        block_list = list(blocks)
+        if new_positions is not None:
+            orig = [int(b.original_position) for b in block_list]
+            assert len(new_positions) == len(block_list), (
+                "new_positions must align with the load spec's block list"
+            )
+            return CPULoadStoreSpec(
+                [b.block_id for b in block_list],
+                original_positions=orig,
+                new_positions=list(new_positions),
+            )
+        return CPULoadStoreSpec([b.block_id for b in block_list])
 
     # --- OffloadingManager interface ---
 
@@ -116,6 +145,7 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        new_positions: Sequence[int] | None = None,
     ) -> LoadStoreSpec:
         blocks = []
         for key in keys:
@@ -124,7 +154,7 @@ class CPUOffloadingManager(OffloadingManager):
             assert block.is_ready, f"Block {key!r} is not ready for reading"
             block.ref_cnt += 1
             blocks.append(block)
-        return self._get_load_store_spec(keys, blocks)
+        return self._get_load_store_spec(keys, blocks, new_positions=new_positions)
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._policy.touch(keys)
@@ -142,10 +172,19 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        original_positions: Sequence[int] | None = None,
     ) -> PrepareStoreOutput | None:
+        key_to_pos: dict[OffloadKey, int] | None = None
+        if original_positions is not None:
+            keys_list = list(keys)
+            assert len(original_positions) == len(keys_list), (
+                "original_positions must align 1:1 with keys"
+            )
+            key_to_pos = dict(zip(keys_list, original_positions))
+
         if self.counts is not None:
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
-        # filter out blocks that are already stored
+
         keys_to_store = [k for k in keys if self._policy.get(k) is None]
 
         if not keys_to_store:
@@ -159,8 +198,6 @@ class CPUOffloadingManager(OffloadingManager):
 
         to_evict: list[OffloadKey] = []
         if num_blocks_to_evict > 0:
-            # Blocks from the original input are excluded from eviction candidates:
-            # a block that was already stored must remain in the cache after this call.
             protected = set(keys)
             evicted = self._policy.evict(num_blocks_to_evict, protected)
             if evicted is None:
@@ -178,7 +215,12 @@ class CPUOffloadingManager(OffloadingManager):
                 )
             )
 
-        blocks = self._allocate_blocks(keys_to_store)
+        positions_for_alloc: list[int] | None = None
+        if key_to_pos is not None:
+            positions_for_alloc = [key_to_pos.get(k, -1) for k in keys_to_store]
+        blocks = self._allocate_blocks(
+            keys_to_store, original_positions=positions_for_alloc
+        )
         assert len(blocks) == len(keys_to_store), (
             "Block pool did not allocate the expected number of blocks"
         )
@@ -186,7 +228,6 @@ class CPUOffloadingManager(OffloadingManager):
         for key, block in zip(keys_to_store, blocks):
             self._policy.insert(key, block)
 
-        # build store specs for allocated blocks
         store_spec = self._get_load_store_spec(keys_to_store, blocks)
 
         return PrepareStoreOutput(
@@ -240,3 +281,20 @@ class CPUOffloadingManager(OffloadingManager):
         if self.events is not None:
             yield from self.events
             self.events.clear()
+
+    def recommend_recovery(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int,
+        resident_max_similarity: float = 0.0,
+        min_similarity: float = 0.0,
+    ) -> list[tuple[OffloadKey, float]]:
+        if top_k <= 0 or not hasattr(self._policy, "select_for_recovery"):
+            return []
+        return self._policy.select_for_recovery(
+            query_embedding=query_embedding,
+            candidate_keys=list(self._policy.blocks.keys()),
+            resident_max_similarity=resident_max_similarity,
+            top_k=top_k,
+            min_similarity=min_similarity,
+        )

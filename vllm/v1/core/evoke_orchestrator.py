@@ -22,6 +22,7 @@ capture module so that:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -31,9 +32,12 @@ from vllm.v1.attention.evoke_attn_capture import (
     CaptureRecord,
     aggregate_per_block,
 )
+from vllm.v1.kv_offload.cpu.policies.evoke import cosine_similarity
 
 if TYPE_CHECKING:
     from vllm.v1.core.eviction_policy import EvokeBlockEvictionPolicy
+    from vllm.v1.kv_offload.base import OffloadKey
+    from vllm.v1.kv_offload.cpu.policies.evoke import EvokeCachePolicy
 
 
 class EvokeCaptureOrchestrator:
@@ -108,3 +112,67 @@ class EvokeCaptureOrchestrator:
         smart-recovery selection can score this block against future
         user-message queries."""
         self.policy.set_embedding(block_id, embedding)
+
+    def resident_max_similarity(self, query_embedding: np.ndarray) -> float:
+        """Return the strongest cosine similarity between the query and any
+        currently-resident block embedding on the GPU policy. Used as the
+        gate that an evicted candidate must beat to be worth recovering: a
+        block already on GPU that matches the query as well as the candidate
+        would makes the recovery wasted bandwidth.
+        """
+        best = 0.0
+        for meta in self.policy.meta.values():
+            if meta.embedding is None:
+                continue
+            sim = cosine_similarity(query_embedding, meta.embedding)
+            if sim > best:
+                best = sim
+        return best
+
+    def recommend_recovery(
+        self,
+        query_embedding: np.ndarray,
+        offload_policy: "EvokeCachePolicy",
+        top_k: int,
+        candidate_keys: Iterable["OffloadKey"] | None = None,
+        min_similarity: float = 0.0,
+    ) -> list[tuple["OffloadKey", float]]:
+        """Select evicted (offloaded) blocks worth bringing back for the
+        next user turn.
+
+        Combines GPU-side and CPU-side EVOKE state:
+        - resident max similarity gate is computed against the GPU policy's
+          embeddings, so a block that the model already has on-cache cannot
+          be pre-empted by a weaker offloaded candidate.
+        - actual ranking + threshold logic lives in
+          `EvokeCachePolicy.select_for_recovery`.
+
+        Args:
+            query_embedding: encoder embedding of the incoming user message.
+            offload_policy: the CPU-tier EVOKE policy whose blocks we are
+                ranking for recovery.
+            top_k: maximum number of keys to return.
+            candidate_keys: restrict to this subset of keys (defaults to all
+                blocks currently in the offload policy).
+            min_similarity: absolute floor a candidate must beat in addition
+                to the resident max similarity.
+
+        Returns:
+            List of (OffloadKey, similarity) ordered by similarity desc, at
+            most top_k entries. Empty when no candidate beats the gate.
+        """
+        if top_k <= 0:
+            return []
+        resident_max = self.resident_max_similarity(query_embedding)
+        keys = (
+            list(candidate_keys)
+            if candidate_keys is not None
+            else list(offload_policy.blocks.keys())
+        )
+        return offload_policy.select_for_recovery(
+            query_embedding=query_embedding,
+            candidate_keys=keys,
+            resident_max_similarity=resident_max,
+            top_k=top_k,
+            min_similarity=min_similarity,
+        )

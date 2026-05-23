@@ -11,6 +11,8 @@ from vllm.v1.attention.evoke_attn_capture import (
 )
 from vllm.v1.core.eviction_policy import EvokeBlockEvictionPolicy
 from vllm.v1.core.evoke_orchestrator import EvokeCaptureOrchestrator
+from vllm.v1.kv_offload.cpu.policies.base import BlockStatus
+from vllm.v1.kv_offload.cpu.policies.evoke import EvokeCachePolicy
 
 
 @dataclass
@@ -162,3 +164,79 @@ def test_high_attention_block_outscores_low_after_capture():
     chosen = policy.select_eviction_candidates(n=1, protected=set())
     assert chosen is not None
     assert chosen[0].block_id == 11
+
+
+def test_resident_max_similarity_picks_best_resident_block():
+    policy = EvokeBlockEvictionPolicy()
+    _seed_policy(policy, [0, 1, 2])
+    policy.set_embedding(0, np.array([1.0, 0.0], dtype=np.float32))
+    policy.set_embedding(1, np.array([0.6, 0.8], dtype=np.float32))
+    policy.set_embedding(2, np.array([0.0, 1.0], dtype=np.float32))
+    orch = EvokeCaptureOrchestrator(policy)
+
+    query = np.array([1.0, 0.0], dtype=np.float32)
+    assert abs(orch.resident_max_similarity(query) - 1.0) < 1e-6
+
+
+def test_resident_max_similarity_returns_zero_when_no_embeddings():
+    policy = EvokeBlockEvictionPolicy()
+    _seed_policy(policy, [0, 1])
+    orch = EvokeCaptureOrchestrator(policy)
+    assert orch.resident_max_similarity(np.array([1.0, 0.0], dtype=np.float32)) == 0.0
+
+
+def _stage_offload_block(
+    offload_policy: EvokeCachePolicy,
+    key: bytes,
+    embedding: np.ndarray,
+    block_id: int = 0,
+) -> None:
+    offload_policy.insert(key, BlockStatus(block_id))
+    offload_policy.set_embedding(key, embedding)
+
+
+def test_recommend_recovery_returns_keys_beating_resident_gate():
+    gpu_policy = EvokeBlockEvictionPolicy()
+    _seed_policy(gpu_policy, [0])
+    gpu_policy.set_embedding(0, np.array([0.5, 0.5], dtype=np.float32))
+    orch = EvokeCaptureOrchestrator(gpu_policy)
+
+    offload = EvokeCachePolicy(cache_capacity=4)
+    _stage_offload_block(offload, b"hit", np.array([1.0, 0.0], dtype=np.float32))
+    _stage_offload_block(offload, b"weak", np.array([0.4, 0.6], dtype=np.float32))
+
+    query = np.array([1.0, 0.0], dtype=np.float32)
+    recs = orch.recommend_recovery(query, offload, top_k=2)
+    keys = [k for k, _ in recs]
+    assert keys[0] == b"hit"
+    assert b"weak" not in keys
+
+
+def test_recommend_recovery_top_k_zero_is_noop():
+    gpu_policy = EvokeBlockEvictionPolicy()
+    orch = EvokeCaptureOrchestrator(gpu_policy)
+    offload = EvokeCachePolicy(cache_capacity=4)
+    _stage_offload_block(offload, b"hit", np.array([1.0, 0.0], dtype=np.float32))
+
+    assert (
+        orch.recommend_recovery(
+            np.array([1.0, 0.0], dtype=np.float32),
+            offload,
+            top_k=0,
+        )
+        == []
+    )
+
+
+def test_recommend_recovery_blocks_dominated_by_resident_returns_empty():
+    gpu_policy = EvokeBlockEvictionPolicy()
+    _seed_policy(gpu_policy, [0])
+    gpu_policy.set_embedding(0, np.array([1.0, 0.0], dtype=np.float32))
+    orch = EvokeCaptureOrchestrator(gpu_policy)
+
+    offload = EvokeCachePolicy(cache_capacity=4)
+    _stage_offload_block(offload, b"weak", np.array([0.7, 0.7], dtype=np.float32))
+
+    query = np.array([1.0, 0.0], dtype=np.float32)
+    recs = orch.recommend_recovery(query, offload, top_k=2)
+    assert recs == []
