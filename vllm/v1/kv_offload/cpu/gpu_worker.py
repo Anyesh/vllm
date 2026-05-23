@@ -17,6 +17,8 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     GPULoadStoreSpec,
 )
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.cpu.evoke_rope_delta import EvokeRopeDeltaRotator
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingHandler,
@@ -125,6 +127,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         mmap_region: SharedOffloadRegion | None = None,
+        evoke_rope_rotator: EvokeRopeDeltaRotator | None = None,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -178,6 +181,14 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self._stream_pool: list[torch.cuda.Stream] = []
         # list of CUDA events available for re-use
         self._event_pool: list[torch.Event] = []
+        # EVOKE smart-recovery: when set and direction is CPU->GPU, the
+        # rotator applies a RoPE delta to recovered K blocks on the transfer
+        # stream after the swap_blocks_batch completes and before the end
+        # event fires. Only fires for blocks whose load spec carries
+        # original_position != new_position; otherwise no-op.
+        self.evoke_rope_rotator: EvokeRopeDeltaRotator | None = (
+            evoke_rope_rotator if not gpu_to_cpu else None
+        )
 
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
         src_spec, dst_spec = transfer_spec
@@ -332,6 +343,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                     batch_sizes,
                     is_src_access_order_any=is_src_access_order_any,
                 )
+            self._maybe_apply_evoke_rope_delta(stream, src_spec, dst_spec)
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
@@ -347,6 +359,43 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         # success
         return True
+
+    def _maybe_apply_evoke_rope_delta(
+        self,
+        stream: torch.cuda.Stream,
+        src_spec: BlockIDsLoadStoreSpec,
+        dst_spec: BlockIDsLoadStoreSpec,
+    ) -> None:
+        """Apply RoPE-delta rotation on recovered K blocks. No-op unless the
+        handler has an EvokeRopeDeltaRotator installed AND the load spec
+        carries non-trivial (orig, new) position pairs. Called between the
+        swap_blocks_batch transfer and the completion event on the same
+        stream so the next forward pass that reads these blocks sees
+        correctly-positioned K bytes."""
+        rotator = self.evoke_rope_rotator
+        if rotator is None or not isinstance(src_spec, CPULoadStoreSpec):
+            return
+        original_positions = getattr(src_spec, "original_positions", None)
+        new_positions = getattr(src_spec, "new_positions", None)
+        if original_positions is None or new_positions is None:
+            return
+        if not any(
+            int(o) >= 0 and int(n) >= 0 and int(o) != int(n)
+            for o, n in zip(original_positions, new_positions)
+        ):
+            return
+        rotated = rotator.maybe_rotate_blocks(
+            stream,
+            block_ids=list(dst_spec.block_ids),
+            original_positions=list(original_positions),
+            new_positions=list(new_positions),
+        )
+        if rotated:
+            logger.info(
+                "EVOKE RoPE-delta rotator FIRED: %d blocks re-anchored on "
+                "transfer stream",
+                rotated,
+            )
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
@@ -397,6 +446,7 @@ class CpuGpuOffloadingHandlers:
         block_size_factor: int,
         num_cpu_blocks: int,
         mmap_region: SharedOffloadRegion | None = None,
+        evoke_rope_rotator: EvokeRopeDeltaRotator | None = None,
     ):
         pin_memory = is_pin_memory_available()
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
@@ -449,4 +499,5 @@ class CpuGpuOffloadingHandlers:
             block_size_factor=block_size_factor,
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=False,
+            evoke_rope_rotator=evoke_rope_rotator,
         )
