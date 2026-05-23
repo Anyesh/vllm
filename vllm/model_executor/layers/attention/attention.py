@@ -31,7 +31,15 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
-from vllm.v1.attention.evoke_attn_capture import maybe_capture as _evoke_maybe_capture
+from vllm.v1.attention.evoke_attn_capture import (
+    is_enabled as _evoke_is_enabled,
+)
+from vllm.v1.attention.evoke_attn_capture import (
+    maybe_capture as _evoke_maybe_capture,
+)
+from vllm.v1.attention.evoke_attn_capture import (
+    reconstruct_key_full_paged as _evoke_reconstruct_key_full_paged,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
@@ -488,8 +496,35 @@ class Attention(nn.Module, AttentionLayerBase):
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
         # EVOKE attention-weight capture: no-op for layers not registered.
-        # See vllm/v1/attention/evoke_attn_capture.py.
-        _evoke_maybe_capture(self.layer_name, query, key, value)
+        # When the layer is registered we attempt to reconstruct K_full from
+        # the paged KV cache so the side-compute returns real softmax(QK^T)
+        # weights. The reconstruction touches forward_context which may not
+        # exist in profiling / eager contexts; on any failure we silently
+        # fall back to recording shape metadata only. See
+        # vllm/v1/attention/evoke_attn_capture.py.
+        if _evoke_is_enabled(self.layer_name):
+            evoke_key_full: torch.Tensor | None = None
+            try:
+                kv_cache_tensor = self.kv_cache[get_forward_context().virtual_engine]
+                key_cache_tensor = kv_cache_tensor.unbind(0)[0]
+                attn_metadata_local = get_forward_context().attn_metadata
+                if attn_metadata_local is not None and key_cache_tensor.numel() > 0:
+                    block_table = attn_metadata_local.block_table
+                    seq_lens = attn_metadata_local.seq_lens
+                    block_size = key_cache_tensor.shape[1]
+                    # Single-sequence capture: take the first sequence's row.
+                    if block_table is not None and seq_lens is not None:
+                        evoke_key_full = _evoke_reconstruct_key_full_paged(
+                            key_cache_tensor,
+                            block_table[0],
+                            int(seq_lens[0]),
+                            block_size,
+                        )
+            except Exception:
+                evoke_key_full = None
+            _evoke_maybe_capture(
+                self.layer_name, query, key, value, key_full=evoke_key_full
+            )
         kv_cache_dummy_dep = None
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
