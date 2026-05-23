@@ -160,11 +160,24 @@ class EvokeRequestMeta:
     block allocated for the request at on_block_freed time so source-type
     floors, harness priority, and pinning take effect without further
     plumbing through the scheduler hot path.
+
+    Smart-recovery fields (`query_embedding`, `recover_top_k`) are consulted
+    at request admission: the connector scheduler calls
+    `EvokeCaptureOrchestrator.recommend_recovery` against the offload
+    manager's policy, augments the request's `keys_to_load` with the
+    returned offloaded blocks, and the worker re-anchors them via the
+    RoPE-delta rotator on load. `query_embedding` is stored as a
+    `list[float]` (not numpy) so it serializes cleanly across the engine's
+    ZMQ boundary; it is converted to `np.ndarray` at the consumption site
+    in the orchestrator.
     """
 
     source_type: str | None = None
     priority: float = 1.0
     pinned: bool = False
+    query_embedding: list[float] | None = None
+    recover_top_k: int = 0
+    min_similarity: float = 0.0
 
 
 class EvokeBlockEvictionPolicy(BlockEvictionPolicy):

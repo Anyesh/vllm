@@ -308,6 +308,48 @@ def test_request_meta_drives_eviction_via_floor():
     assert chosen[0].block_id == 1
 
 
+def test_evoke_request_meta_carries_recovery_fields():
+    """Smart-recovery fields default to no-op (recover_top_k=0, no embedding)
+    so non-EVOKE-aware callers don't accidentally trigger recovery. When set,
+    the fields are accessible on the dataclass for the scheduler-side hook
+    to consult."""
+    meta = EvokeRequestMeta()
+    assert meta.query_embedding is None
+    assert meta.recover_top_k == 0
+    assert meta.min_similarity == 0.0
+
+    meta_with_recovery = EvokeRequestMeta(
+        source_type=SOURCE_USER,
+        query_embedding=[0.1, 0.2, 0.3, 0.4],
+        recover_top_k=4,
+        min_similarity=0.5,
+    )
+    assert meta_with_recovery.query_embedding == [0.1, 0.2, 0.3, 0.4]
+    assert meta_with_recovery.recover_top_k == 4
+    assert meta_with_recovery.min_similarity == 0.5
+
+
+def test_request_meta_dict_with_recovery_fields_round_trips_through_register():
+    """Mirror what EngineCore.add_request does: build the EvokeRequestMeta
+    from a dict (the form that arrives via sampling_params.extra_args), set
+    it on the policy, then read it back. The recovery fields must survive
+    that round trip so the connector scheduler can consult them later."""
+    policy = EvokeBlockEvictionPolicy()
+    meta = EvokeRequestMeta(
+        source_type=SOURCE_USER,
+        priority=1.2,
+        pinned=False,
+        query_embedding=[0.7, 0.3, 0.1],
+        recover_top_k=8,
+        min_similarity=0.2,
+    )
+    policy.set_request_meta("req-recovery", meta)
+    got = policy.request_meta["req-recovery"]
+    assert got.recover_top_k == 8
+    assert got.query_embedding == [0.7, 0.3, 0.1]
+    assert got.min_similarity == 0.2
+
+
 def test_request_meta_pinned_prevents_eviction():
     policy = EvokeBlockEvictionPolicy()
     policy.set_request_meta(

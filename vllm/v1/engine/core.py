@@ -103,10 +103,16 @@ def _evoke_register_request_meta(scheduler, request_id, meta_dict):
         if isinstance(meta_dict, EvokeRequestMeta):
             meta_obj = meta_dict
         else:
+            query_embedding = meta_dict.get("query_embedding")
+            if query_embedding is not None:
+                query_embedding = [float(x) for x in query_embedding]
             meta_obj = EvokeRequestMeta(
                 source_type=meta_dict.get("source_type"),
                 priority=float(meta_dict.get("priority", 1.0)),
                 pinned=bool(meta_dict.get("pinned", False)),
+                query_embedding=query_embedding,
+                recover_top_k=int(meta_dict.get("recover_top_k", 0)),
+                min_similarity=float(meta_dict.get("min_similarity", 0.0)),
             )
         policy.set_request_meta(request_id, meta_obj)
     except Exception:
