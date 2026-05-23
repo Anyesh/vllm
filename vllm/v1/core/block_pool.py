@@ -26,6 +26,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
+from vllm.v1.core.eviction_policy import BlockEvictionPolicy
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -153,6 +154,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        eviction_policy: BlockEvictionPolicy | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -180,6 +182,19 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+        # Optional pluggable eviction policy. When set, get_new_blocks routes
+        # the eviction selection through the policy instead of strict FIFO
+        # popleft. The free_block_queue remains the truth-source for "is in
+        # free pool" and "num_free_blocks"; the policy is the parallel scorer.
+        # When None (the default), behavior is identical to before this hook
+        # was added: the queue's LRU order picks evictions. See
+        # vllm/v1/core/eviction_policy.py.
+        self.eviction_policy: BlockEvictionPolicy | None = eviction_policy
+        if self.eviction_policy is not None:
+            for block in self.blocks:
+                if not block.is_null:
+                    self.eviction_policy.on_block_freed(block)
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -344,7 +359,25 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self.eviction_policy is not None:
+            chosen = self.eviction_policy.select_eviction_candidates(
+                num_blocks, protected=set()
+            )
+            if chosen is not None and len(chosen) == num_blocks:
+                ret: list[KVCacheBlock] = chosen
+                for block in chosen:
+                    self.free_block_queue.remove(block)
+                    self.eviction_policy.on_block_allocated(block)
+            else:
+                # Policy refused (every candidate was pinned or floored above
+                # the eviction threshold). Fall back to the queue so the
+                # allocation does not stall; the policy still observes the
+                # mutation so its state stays consistent.
+                ret = self.free_block_queue.popleft_n(num_blocks)
+                for block in ret:
+                    self.eviction_policy.on_block_allocated(block)
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -412,6 +445,8 @@ class BlockPool:
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+                if self.eviction_policy is not None:
+                    self.eviction_policy.on_block_allocated(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -428,9 +463,13 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+        freed_now = [
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+        ]
+        self.free_block_queue.append_n(freed_now)
+        if self.eviction_policy is not None:
+            for block in freed_now:
+                self.eviction_policy.on_block_freed(block)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
