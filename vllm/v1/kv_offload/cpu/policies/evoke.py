@@ -1,10 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+import numpy as np
 
 from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
+
+# Source-type strings used by the floor map. Harnesses are free to use any
+# string; the canonical EVOKE set is below. Unknown source types fall through
+# to no floor.
+SOURCE_USER = "user"
+SOURCE_ASSISTANT = "assistant"
+SOURCE_DOCUMENT = "document"
+SOURCE_SYSTEM = "system"
 
 
 @dataclass
@@ -12,6 +22,17 @@ class EvokeBlockMeta:
     last_touch_tick: int
     priority: float = 1.0
     recovery_strength: float = 0.0
+    source_type: str | None = None
+    pinned: bool = False
+    embedding: np.ndarray | None = field(default=None, repr=False)
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
 
 
 class EvokeCachePolicy(CachePolicy):
@@ -20,13 +41,17 @@ class EvokeCachePolicy(CachePolicy):
     Scores each block as a weighted sum of recency, coherence (similarity to
     the current task focus), recovery_strength (the model's own signal that a
     block was load-bearing on a recent turn), and a harness-supplied priority
-    multiplier. The lowest-scoring blocks are evicted first.
+    multiplier. The score is lifted to a source-type floor before being
+    multiplied by priority, so conversation-backbone content (user and
+    assistant turns) outlives document content under budget pressure unless
+    the harness overrides the priority. The lowest-scoring blocks evict
+    first.
 
-    This is the phase-1 stub: recency is wired and the priority multiplier is
-    in place; coherence and recovery_strength are reserved fields with zero
-    weight by default. Smart-recovery via retrieval encoder and the
-    attention-capture signal land in subsequent phases. The plugin surface
-    here is what the wider policy will hook into.
+    Smart-recovery selection (top-K bring-back at turn boundary, gated by
+    retrieval-encoder similarity) is supported via the embedding-storage
+    hooks (set_embedding / get_embedding); the orchestrator that performs
+    selection lives one layer above the policy and consumes the embeddings
+    stored here.
     """
 
     def __init__(self, cache_capacity: int) -> None:
@@ -37,10 +62,14 @@ class EvokeCachePolicy(CachePolicy):
         self.w_coherence: float = 0.6
         self.w_recovery: float = 0.0
         self.recency_half_life: int = 64
+        self.source_floors: dict[str, float] = {
+            SOURCE_USER: 0.6,
+            SOURCE_ASSISTANT: 0.5,
+            SOURCE_SYSTEM: 0.6,
+        }
 
     def _recency(self, key: OffloadKey) -> float:
         age = self._tick - self.meta[key].last_touch_tick
-        # half-life decay: at age = recency_half_life, recency = 0.5
         return 0.5 ** (age / max(1, self.recency_half_life))
 
     def _score(self, key: OffloadKey) -> float:
@@ -53,6 +82,9 @@ class EvokeCachePolicy(CachePolicy):
             + self.w_coherence * coherence
             + self.w_recovery * recovery
         )
+        if meta.source_type is not None:
+            floor = self.source_floors.get(meta.source_type, 0.0)
+            raw = max(raw, floor)
         return raw * meta.priority
 
     def get(self, key: OffloadKey) -> BlockStatus | None:
@@ -84,7 +116,8 @@ class EvokeCachePolicy(CachePolicy):
             return []
         evictable: list[tuple[OffloadKey, BlockStatus, float]] = []
         for key, block in self.blocks.items():
-            if block.ref_cnt == 0 and key not in protected:
+            meta = self.meta[key]
+            if block.ref_cnt == 0 and key not in protected and not meta.pinned:
                 evictable.append((key, block, self._score(key)))
         if len(evictable) < n:
             return None
@@ -96,3 +129,51 @@ class EvokeCachePolicy(CachePolicy):
             del self.meta[key]
             result.append((key, block))
         return result
+
+    def set_source_type(self, key: OffloadKey, source_type: str | None) -> None:
+        if key in self.meta:
+            self.meta[key].source_type = source_type
+
+    def set_priority(self, key: OffloadKey, priority: float) -> None:
+        if key in self.meta:
+            self.meta[key].priority = priority
+
+    def set_pinned(self, key: OffloadKey, pinned: bool) -> None:
+        if key in self.meta:
+            self.meta[key].pinned = pinned
+
+    def set_embedding(self, key: OffloadKey, embedding: np.ndarray) -> None:
+        if key in self.meta:
+            self.meta[key].embedding = embedding
+
+    def get_embedding(self, key: OffloadKey) -> np.ndarray | None:
+        meta = self.meta.get(key)
+        return meta.embedding if meta is not None else None
+
+    def select_for_recovery(
+        self,
+        query_embedding: np.ndarray,
+        candidate_keys: Iterable[OffloadKey],
+        resident_max_similarity: float,
+        top_k: int,
+        min_similarity: float = 0.0,
+    ) -> list[tuple[OffloadKey, float]]:
+        """Smart-recovery selection: rank candidate (evicted) blocks by
+        cosine similarity to the query, gated against the strongest
+        already-resident match so that weak recoveries cannot pollute the
+        cache with off-topic content.
+
+        Returns the top-k (key, similarity) pairs ordered by similarity
+        desc. A candidate must beat both `min_similarity` and
+        `resident_max_similarity` to be returned.
+        """
+        ranked: list[tuple[OffloadKey, float]] = []
+        for key in candidate_keys:
+            meta = self.meta.get(key)
+            if meta is None or meta.embedding is None:
+                continue
+            sim = cosine_similarity(query_embedding, meta.embedding)
+            if sim >= min_similarity and sim > resident_max_similarity:
+                ranked.append((key, sim))
+        ranked.sort(key=lambda kv: kv[1], reverse=True)
+        return ranked[:top_k]
